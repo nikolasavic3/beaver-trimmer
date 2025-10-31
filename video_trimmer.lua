@@ -240,36 +240,62 @@ function parse_filename(filepath, regex)
     local base_name, ext = filename:match("^(.-)%.([^%.]+)$")
     
     if not base_name then
-        return nil, nil, nil, nil, nil, nil, nil
+        return nil, nil, nil, nil, nil, nil, nil, nil, nil
     end
     
     -- Try to match the pattern in filename and capture separator
     local date_part, time_part = base_name:match(regex)
     local separator = ""
-    local name_without_timestamp = base_name
+    local prefix = ""
+    local timestamp_str = ""
+    local suffix = ""
     
     if date_part and time_part then
-        -- Find the separator between date and time
+        -- Determine separator as found between date and time (if any)
         separator = base_name:match(date_part .. "([_%-]?)" .. time_part) or "_"
-        
-        -- Remove the full timestamp pattern from the filename
-        name_without_timestamp = base_name:gsub(date_part .. "[_%-]?" .. time_part, "")
-        name_without_timestamp = name_without_timestamp:gsub("[_%-]+$", "")
-    elseif not date_part and not time_part then
+        -- Find exact span where the full timestamp occurs, so we preserve its position
+        local pattern_literal = date_part .. (separator ~= "" and separator or "") .. time_part
+        local s, e = base_name:find(pattern_literal, 1, true)
+        if s and e then
+            prefix = base_name:sub(1, s - 1)
+            timestamp_str = base_name:sub(s, e)
+            suffix = base_name:sub(e + 1)
+        else
+            -- Fallback: remove first occurrence and treat as suffix-only
+            prefix = base_name:gsub(date_part .. "[_%-]?" .. time_part, "", 1)
+            timestamp_str = date_part .. (separator ~= "" and separator or "") .. time_part
+            suffix = ""
+        end
+    else
         -- Try matching just time (HHMMSS) as fallback
-        time_part = base_name:match("(%d%d%d%d%d%d)")
-        if time_part then
-            name_without_timestamp = base_name:gsub(time_part, "")
-            name_without_timestamp = name_without_timestamp:gsub("[_%-]+$", "")
+        local just_time = base_name:match("(%d%d%d%d%d%d)")
+        if just_time then
+            local s, e = base_name:find(just_time, 1, true)
+            if s and e then
+                prefix = base_name:sub(1, s - 1)
+                timestamp_str = base_name:sub(s, e)
+                suffix = base_name:sub(e + 1)
+                time_part = just_time
+                date_part = nil
+                separator = ""
+            end
+        else
+            -- No timestamp found; prefix is whole name
+            prefix = base_name
+            timestamp_str = ""
+            suffix = ""
+            date_part = nil
+            time_part = nil
+            separator = ""
         end
     end
     
-    return filename, base_name, name_without_timestamp, date_part, time_part, ext, separator
+    return filename, base_name, prefix, timestamp_str, suffix, date_part, time_part, ext, separator
 end
 
--- Helper function: Generate smart filename
+-- Helper function: Generate smart filename (preserve original timestamp position)
 function generate_smart_filename(filepath, start_seconds, use_smart_naming, regex, output_dir)
-    local filename, base_name, name_without_timestamp, date_part, time_part, ext, separator = parse_filename(filepath, regex)
+    local filename, base_name, prefix, timestamp_str, suffix, date_part, time_part, ext, separator = parse_filename(filepath, regex)
     
     if not filename then
         return join_path(output_dir, get_filename_from_path(filepath):gsub("%.([^%.]+)$", "_trim.%1"))
@@ -277,21 +303,27 @@ function generate_smart_filename(filepath, start_seconds, use_smart_naming, rege
     
     local new_filename
     
-    if use_smart_naming and time_part then
+    if use_smart_naming and time_part and timestamp_str ~= "" then
+        -- Compute new timestamp parts
         local new_date_part, new_time_part = add_seconds_to_timestamp(date_part, time_part, start_seconds)
+        local new_timestamp = ""
         
         if new_date_part then
-            -- Use the original separator (or default to "_")
-            if separator == "" then separator = "_" end
-            new_filename = name_without_timestamp .. new_date_part .. separator .. new_time_part .. "." .. ext
+            -- Use original separator if present, otherwise default to "_"
+            local sep = separator ~= "" and separator or "_"
+            new_timestamp = new_date_part .. sep .. new_time_part
         else
-            new_filename = name_without_timestamp .. new_time_part .. "." .. ext
+            new_timestamp = new_time_part
         end
         
-        -- Clean up double separators
+        -- Reconstruct filename preserving original position: prefix + new_timestamp + suffix
+        new_filename = prefix .. new_timestamp .. suffix .. "." .. ext
+        
+        -- Clean up double separators and leading separators if any
         new_filename = new_filename:gsub("[_%-][_%-]+", "_")
         new_filename = new_filename:gsub("^[_%-]", "")
     else
+        -- Fallback: append _trim as before
         new_filename = base_name .. "_trim." .. ext
     end
     
