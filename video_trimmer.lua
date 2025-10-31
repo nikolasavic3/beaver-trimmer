@@ -1,6 +1,6 @@
 --[[
  Video Trimmer Extension for VLC
- Version: 2.6
+ Version: 2.7.1
  
  Features:
  - Set start/end times manually or capture from playback
@@ -12,6 +12,8 @@
  - Move original video to folder & play next (per folder)
  - History display showing all completed trims AND moves with full paths
  - Navigate to next video after processing (with option to delete original)
+ - Universal codec support (auto re-encodes audio to AAC)
+ - Windows path handling fixed
  
  CUSTOMIZE YOUR FOLDERS:
  Edit the FOLDER_CONFIG table below to set your folder names
@@ -57,7 +59,7 @@ local default_regex = "(%d%d%d%d%d%d%d%d)[_%-]?(%d%d%d%d%d%d)"
 function descriptor()
     return {
         title = "Video Trimmer",
-        version = "2.6",
+        version = "2.7.1",
         author = "VLC User",
         capabilities = {"input-listener"}
     }
@@ -208,12 +210,26 @@ function get_video_path()
     if item then
         local uri = item:uri()
         if uri then
-            -- Fix for Linux: Keep the leading slash
-            local path = uri:gsub("^file:///", "/")
-            path = path:gsub("^file://", "/")
+            -- Decode the URI
+            local path = uri:gsub("^file:///", "")
+            path = path:gsub("^file://", "")
+            
+            -- URL decode
             path = path:gsub("%%(%x%x)", function(hex)
                 return string.char(tonumber(hex, 16))
             end)
+            
+            -- Fix Windows paths - remove leading slash and ensure backslashes
+            if path:match("^/%a:") then
+                -- Windows path with leading slash: /C:/path -> C:\path
+                path = path:gsub("^/", "")
+                path = path:gsub("/", "\\")
+            elseif path:match("^%a:") then
+                -- Windows path without leading slash: C:/path -> C:\path
+                path = path:gsub("/", "\\")
+            end
+            -- Linux paths stay as-is with forward slashes
+            
             return path
         end
     end
@@ -503,14 +519,32 @@ function execute_trim_to_directory(dir_path)
     local output_file = generate_smart_filename(current_video_path, start_sec, use_smart_naming, regex, dir_path)
     
     local duration = end_sec - start_sec
-    local cmd = string.format('%s -i "%s" -ss %.3f -t %.3f -c copy "%s"',
+    
+    -- Universal solution: Copy video, re-encode audio to AAC for maximum compatibility
+    local cmd = string.format('%s -y -i "%s" -ss %.3f -t %.3f -c:v copy -c:a aac -b:a 128k "%s" 2>&1',
         ffmpeg_path,
         current_video_path,
         start_sec,
         duration,
         output_file)
     
-    local result = os.execute(cmd)
+    -- Try to capture error output
+    local handle = io.popen(cmd)
+    local cmd_output = ""
+    if handle then
+        cmd_output = handle:read("*a")
+        handle:close()
+    end
+    
+    -- Check if output file exists and has content
+    local file_exists = false
+    local file_size = 0
+    local test_file = io.open(output_file, "rb")
+    if test_file then
+        file_size = test_file:seek("end")
+        test_file:close()
+        file_exists = true
+    end
     
     local history_entry = {
         type = "trim",
@@ -519,7 +553,7 @@ function execute_trim_to_directory(dir_path)
         start_sec = start_sec,
         end_sec = end_sec,
         output_file = output_file,
-        status = (result == 0 or result == true) and "Completed" or "Failed"
+        status = (file_exists and file_size > 1000) and "Completed" or "Failed"
     }
     
     table.insert(trim_history, history_entry)
@@ -527,7 +561,22 @@ function execute_trim_to_directory(dir_path)
     if history_entry.status == "Completed" then
         update_status("✓ Trim completed: " .. get_filename_from_path(output_file))
     else
-        update_status("✗ Trim failed - check FFmpeg installation")
+        -- Show detailed error
+        if cmd_output:find("codec") then
+            update_status("✗ Codec error - see VLC Messages")
+        elseif cmd_output:find("No such file") then
+            update_status("✗ FFmpeg not found - install FFmpeg")
+        elseif not file_exists then
+            update_status("✗ No output created - FFmpeg failed")
+        elseif file_size < 1000 then
+            update_status("✗ Output too small (" .. file_size .. " bytes)")
+        else
+            update_status("✗ Trim failed - check FFmpeg")
+        end
+        
+        -- Log error to VLC console (View -> Messages in VLC)
+        vlc.msg.err("FFmpeg command: " .. cmd)
+        vlc.msg.err("FFmpeg output: " .. cmd_output:sub(1, 500))
     end
     
     update_history_display()
@@ -759,7 +808,7 @@ function activate()
     current_video_dir = get_directory_from_path(current_video_path)
     selected_output_dir = current_video_dir
     
-    dlg = vlc.dialog("Video Trimmer v2.6")
+    dlg = vlc.dialog("Video Trimmer v2.7.1")
     
     dlg:add_label("<b>Current Playback Time:</b>", 1, 1, 2, 1)
     current_time_label = dlg:add_label("Current: 00:00:00.000", 3, 1, 2, 1)
