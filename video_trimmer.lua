@@ -240,7 +240,9 @@ function parse_filename(filepath, regex)
     local base_name, ext = filename:match("^(.-)%.([^%.]+)$")
     
     if not base_name then
-        return nil, nil, nil, nil, nil, nil, nil, nil, nil
+        -- No extension found, treat entire filename as base_name
+        base_name = filename
+        ext = ""
     end
     
     -- Try to match the pattern in filename and capture separator
@@ -293,12 +295,17 @@ function parse_filename(filepath, regex)
     return filename, base_name, prefix, timestamp_str, suffix, date_part, time_part, ext, separator
 end
 
--- Helper function: Generate smart filename (preserve original timestamp position)
+-- Helper function: Generate smart filename (preserve original timestamp position AND extension)
 function generate_smart_filename(filepath, start_seconds, use_smart_naming, regex, output_dir)
     local filename, base_name, prefix, timestamp_str, suffix, date_part, time_part, ext, separator = parse_filename(filepath, regex)
     
     if not filename then
         return join_path(output_dir, get_filename_from_path(filepath):gsub("%.([^%.]+)$", "_trim.%1"))
+    end
+    
+    -- Ensure we have an extension, even if empty string
+    if not ext or ext == "" then
+        ext = ""
     end
     
     local new_filename
@@ -316,15 +323,23 @@ function generate_smart_filename(filepath, start_seconds, use_smart_naming, rege
             new_timestamp = new_time_part
         end
         
-        -- Reconstruct filename preserving original position: prefix + new_timestamp + suffix
-        new_filename = prefix .. new_timestamp .. suffix .. "." .. ext
+        -- Reconstruct filename preserving original position: prefix + new_timestamp + suffix + extension
+        if ext ~= "" then
+            new_filename = prefix .. new_timestamp .. suffix .. "." .. ext
+        else
+            new_filename = prefix .. new_timestamp .. suffix
+        end
         
         -- Clean up double separators and leading separators if any
         new_filename = new_filename:gsub("[_%-][_%-]+", "_")
         new_filename = new_filename:gsub("^[_%-]", "")
     else
-        -- Fallback: append _trim as before
-        new_filename = base_name .. "_trim." .. ext
+        -- Fallback: append _trim while preserving original extension
+        if ext ~= "" then
+            new_filename = base_name .. "_trim." .. ext
+        else
+            new_filename = base_name .. "_trim"
+        end
     end
     
     return join_path(output_dir, new_filename)
