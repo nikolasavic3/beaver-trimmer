@@ -1,6 +1,6 @@
 --[[
  Video Trimmer Extension for VLC
- Version: 2.5
+ Version: 2.6
  
  Features:
  - Set start/end times manually or capture from playback
@@ -9,7 +9,8 @@
  - Smart filename pattern detection with regex (YYYYMMDDHHMMSS support)
  - Adds trim start time to original timestamp in filename
  - 5 PREDEFINED customizable folder buttons (edit FOLDER_CONFIG below)
- - History display showing all completed trims with full paths
+ - Move original video to folder & play next (per folder)
+ - History display showing all completed trims AND moves with full paths
  - Navigate to next video after processing (with option to delete original)
  
  CUSTOMIZE YOUR FOLDERS:
@@ -35,6 +36,7 @@ local current_video_path = ""
 local current_video_dir = ""
 local selected_output_dir = ""
 local ffmpeg_path = "ffmpeg"
+local pending_move = nil  -- Stores pending move operation {from_path, to_path, to_folder_name}
 
 -- Text input widgets
 local start_time_input = nil
@@ -48,13 +50,14 @@ local regex_preview_label = nil
 local output_dir_label = nil
 
 -- Improved regex patterns for different timestamp formats
-local default_regex = "(%d%d%d%d%d%d%d%d)_?(%d%d%d%d%d%d)"  -- YYYYMMDD_HHMMSS
+-- Matches: YYYYMMDD_HHMMSS or YYYYMMDD-HHMMSS or YYYYMMDDHHMMSS
+local default_regex = "(%d%d%d%d%d%d%d%d)[_%-]?(%d%d%d%d%d%d)"
 
 -- Extension descriptor
 function descriptor()
     return {
         title = "Video Trimmer",
-        version = "2.5",
+        version = "2.6",
         author = "VLC User",
         capabilities = {"input-listener"}
     }
@@ -205,8 +208,9 @@ function get_video_path()
     if item then
         local uri = item:uri()
         if uri then
+            -- Fix for Linux: Keep the leading slash
             local path = uri:gsub("^file:///", "/")
-            path = path:gsub("^file://", "")
+            path = path:gsub("^file://", "/")
             path = path:gsub("%%(%x%x)", function(hex)
                 return string.char(tonumber(hex, 16))
             end)
@@ -236,27 +240,36 @@ function parse_filename(filepath, regex)
     local base_name, ext = filename:match("^(.-)%.([^%.]+)$")
     
     if not base_name then
-        return nil, nil, nil, nil, nil, nil
+        return nil, nil, nil, nil, nil, nil, nil
     end
     
-    local date_part, time_part = parse_timestamp_from_filename(base_name, regex)
+    -- Try to match the pattern in filename and capture separator
+    local date_part, time_part = base_name:match(regex)
+    local separator = ""
     local name_without_timestamp = base_name
     
-    if time_part then
-        if date_part then
-            name_without_timestamp = base_name:gsub(date_part .. "_?" .. time_part, "")
-        else
-            name_without_timestamp = base_name:gsub(time_part, "")
-        end
+    if date_part and time_part then
+        -- Find the separator between date and time
+        separator = base_name:match(date_part .. "([_%-]?)" .. time_part) or "_"
+        
+        -- Remove the full timestamp pattern from the filename
+        name_without_timestamp = base_name:gsub(date_part .. "[_%-]?" .. time_part, "")
         name_without_timestamp = name_without_timestamp:gsub("[_%-]+$", "")
+    elseif not date_part and not time_part then
+        -- Try matching just time (HHMMSS) as fallback
+        time_part = base_name:match("(%d%d%d%d%d%d)")
+        if time_part then
+            name_without_timestamp = base_name:gsub(time_part, "")
+            name_without_timestamp = name_without_timestamp:gsub("[_%-]+$", "")
+        end
     end
     
-    return filename, base_name, name_without_timestamp, date_part, time_part, ext
+    return filename, base_name, name_without_timestamp, date_part, time_part, ext, separator
 end
 
 -- Helper function: Generate smart filename
 function generate_smart_filename(filepath, start_seconds, use_smart_naming, regex, output_dir)
-    local filename, base_name, name_without_timestamp, date_part, time_part, ext = parse_filename(filepath, regex)
+    local filename, base_name, name_without_timestamp, date_part, time_part, ext, separator = parse_filename(filepath, regex)
     
     if not filename then
         return join_path(output_dir, get_filename_from_path(filepath):gsub("%.([^%.]+)$", "_trim.%1"))
@@ -268,13 +281,16 @@ function generate_smart_filename(filepath, start_seconds, use_smart_naming, rege
         local new_date_part, new_time_part = add_seconds_to_timestamp(date_part, time_part, start_seconds)
         
         if new_date_part then
-            new_filename = name_without_timestamp .. new_date_part .. "_" .. new_time_part .. "." .. ext
+            -- Use the original separator (or default to "_")
+            if separator == "" then separator = "_" end
+            new_filename = name_without_timestamp .. new_date_part .. separator .. new_time_part .. "." .. ext
         else
             new_filename = name_without_timestamp .. new_time_part .. "." .. ext
         end
         
-        new_filename = new_filename:gsub("__+", "_")
-        new_filename = new_filename:gsub("^_", "")
+        -- Clean up double separators
+        new_filename = new_filename:gsub("[_%-][_%-]+", "_")
+        new_filename = new_filename:gsub("^[_%-]", "")
     else
         new_filename = base_name .. "_trim." .. ext
     end
@@ -318,26 +334,81 @@ function update_history_display()
     if not history_html then return end
     
     local html = "<div style='font-family: monospace; font-size: 9px;'>"
-    html = html .. "<b>TRIM HISTORY:</b><br>"
+    html = html .. "<b>HISTORY:</b><br>"
     
     if #trim_history == 0 then
-        html = html .. "<i>No trims completed yet</i><br>"
+        html = html .. "<i>No operations yet</i><br>"
     else
         for i = #trim_history, 1, -1 do
-            local trim = trim_history[i]
-            html = html .. string.format("%d. %s → %s<br>", 
-                #trim_history - i + 1, trim.start_time, trim.end_time)
-            html = html .. string.format("   📁 %s<br>", trim.output_file)
-            if trim.status == "Completed" then
-                html = html .. "   ✓ Success<br>"
-            else
-                html = html .. "   ✗ Failed<br>"
+            local entry = trim_history[i]
+            
+            if entry.type == "trim" then
+                html = html .. string.format("%d. TRIM: %s → %s<br>", 
+                    #trim_history - i + 1, entry.start_time, entry.end_time)
+                html = html .. string.format("   📁 %s<br>", entry.output_file)
+                if entry.status == "Completed" then
+                    html = html .. "   ✓ Success<br>"
+                else
+                    html = html .. "   ✗ Failed<br>"
+                end
+            elseif entry.type == "move" then
+                html = html .. string.format("%d. MOVE: %s<br>", 
+                    #trim_history - i + 1, entry.filename)
+                html = html .. string.format("   📦 To: %s<br>", entry.to_folder)
+                if entry.status == "Completed" then
+                    html = html .. "   ✓ Success<br>"
+                else
+                    html = html .. "   ✗ Failed<br>"
+                end
             end
         end
     end
     
     html = html .. "</div>"
     history_html:set_text(html)
+end
+
+-- Helper function: Execute pending move operation
+function execute_pending_move()
+    if not pending_move then return end
+    
+    local from_path = pending_move.from_path
+    local to_path = pending_move.to_path
+    local to_folder_name = pending_move.to_folder_name
+    local filename = get_filename_from_path(from_path)
+    
+    -- Execute the move using OS command
+    local cmd
+    if is_windows_path(from_path) then
+        cmd = string.format('move "%s" "%s"', from_path, to_path)
+    else
+        cmd = string.format('mv "%s" "%s"', from_path, to_path)
+    end
+    
+    local result = os.execute(cmd)
+    
+    -- Create history entry
+    local history_entry = {
+        type = "move",
+        filename = filename,
+        from_path = from_path,
+        to_path = to_path,
+        to_folder = to_folder_name,
+        status = (result == 0 or result == true) and "Completed" or "Failed"
+    }
+    
+    table.insert(trim_history, history_entry)
+    
+    if history_entry.status == "Completed" then
+        update_status("✓ Moved: " .. filename .. " → " .. to_folder_name)
+    else
+        update_status("✗ Move failed: " .. filename)
+    end
+    
+    update_history_display()
+    
+    -- Clear pending move
+    pending_move = nil
 end
 
 -- Callback: Execute trim and save to directory
@@ -395,6 +466,7 @@ function execute_trim_to_directory(dir_path)
     local result = os.execute(cmd)
     
     local history_entry = {
+        type = "trim",
         start_time = start_time,
         end_time = end_time,
         start_sec = start_sec,
@@ -416,6 +488,31 @@ function execute_trim_to_directory(dir_path)
     start_time_input:set_text("00:00:00.000")
     end_time_input:set_text("00:00:00.000")
     generate_filename_preview()
+end
+
+-- Callback: Schedule move and play next
+function move_original_and_play_next(folder_path, folder_name)
+    current_video_path = get_video_path()
+    
+    if current_video_path == "" then
+        update_status("ERROR: No video loaded")
+        return
+    end
+    
+    -- Schedule the move (will execute after switching videos)
+    local filename = get_filename_from_path(current_video_path)
+    local to_path = join_path(folder_path, filename)
+    
+    pending_move = {
+        from_path = current_video_path,
+        to_path = to_path,
+        to_folder_name = folder_name
+    }
+    
+    update_status("Moving: " .. filename .. " → " .. folder_name .. " (switching videos...)")
+    
+    -- Play next video
+    play_next_video()
 end
 
 -- Callback: Adjust time by increment
@@ -466,27 +563,36 @@ function play_next_video()
     local playlist = vlc.playlist.get("playlist")
     if playlist and playlist.children then
         vlc.playlist.next()
-        update_status("Playing next video...")
         
+        -- Small delay to let VLC switch videos
         local start_time = os.clock()
         while os.clock() - start_time < 0.5 do end
         
+        -- Execute pending move if there is one
+        if pending_move then
+            execute_pending_move()
+        end
+        
+        -- Update current video info
         current_video_path = get_video_path()
         current_video_dir = get_directory_from_path(current_video_path)
         selected_output_dir = current_video_dir
         
-        trim_history = {}
-        update_history_display()
         generate_filename_preview()
         
         update_status("New video loaded. Please reopen extension to refresh.")
     else
+        -- No more videos in playlist
+        -- Still execute pending move if there is one
+        if pending_move then
+            execute_pending_move()
+        end
         update_status("No more videos in playlist")
     end
 end
 
 function delete_and_play_next()
-    if current_video_path ~= "" and #trim_history > 0 then
+    if current_video_path ~= "" then
         local success, err = os.remove(current_video_path)
         if success then
             update_status("Original video deleted. Loading next...")
@@ -494,7 +600,7 @@ function delete_and_play_next()
             update_status("Failed to delete original: " .. tostring(err))
         end
     else
-        update_status("Nothing to delete (no trims completed)")
+        update_status("Nothing to delete")
     end
     play_next_video()
 end
@@ -526,7 +632,7 @@ function regex_pattern_changed()
     generate_filename_preview()
 end
 
--- Predefined callback functions for each folder button
+-- Predefined callback functions for trim buttons
 function save_to_folder1()
     local folder_path = FOLDER_CONFIG[1].path
     if folder_path == "" then
@@ -572,12 +678,41 @@ function save_to_folder5()
     end
 end
 
+-- Predefined callback functions for move buttons
+function move_to_folder2()
+    local folder_path = FOLDER_CONFIG[2].path
+    if folder_path ~= "" then
+        move_original_and_play_next(join_path(current_video_dir, folder_path), FOLDER_CONFIG[2].name)
+    end
+end
+
+function move_to_folder3()
+    local folder_path = FOLDER_CONFIG[3].path
+    if folder_path ~= "" then
+        move_original_and_play_next(join_path(current_video_dir, folder_path), FOLDER_CONFIG[3].name)
+    end
+end
+
+function move_to_folder4()
+    local folder_path = FOLDER_CONFIG[4].path
+    if folder_path ~= "" then
+        move_original_and_play_next(join_path(current_video_dir, folder_path), FOLDER_CONFIG[4].name)
+    end
+end
+
+function move_to_folder5()
+    local folder_path = FOLDER_CONFIG[5].path
+    if folder_path ~= "" then
+        move_original_and_play_next(join_path(current_video_dir, folder_path), FOLDER_CONFIG[5].name)
+    end
+end
+
 function activate()
     current_video_path = get_video_path()
     current_video_dir = get_directory_from_path(current_video_path)
     selected_output_dir = current_video_dir
     
-    dlg = vlc.dialog("Video Trimmer v2.5")
+    dlg = vlc.dialog("Video Trimmer v2.6")
     
     dlg:add_label("<b>Current Playback Time:</b>", 1, 1, 2, 1)
     current_time_label = dlg:add_label("Current: 00:00:00.000", 3, 1, 2, 1)
@@ -598,38 +733,45 @@ function activate()
     dlg:add_button("+10s", end_time_up_fast, 6, 3, 1, 1)
     dlg:add_button("⏺ Capture", capture_end_time, 7, 3, 1, 1)
     
-    dlg:add_label("<b>Trim & Save to Directory (click button to execute):</b>", 1, 4, 7, 1)
+    dlg:add_label("<b>Trim & Save to Directory:</b>", 1, 4, 7, 1)
     
-    -- PREDEFINED BUTTONS - No loops, no closures, just explicit buttons
+    -- Trim buttons
     dlg:add_button("📁 " .. FOLDER_CONFIG[1].name, save_to_folder1, 1, 5, 1, 1)
     dlg:add_button("📁 " .. FOLDER_CONFIG[2].name, save_to_folder2, 2, 5, 1, 1)
     dlg:add_button("📁 " .. FOLDER_CONFIG[3].name, save_to_folder3, 3, 5, 1, 1)
     dlg:add_button("📁 " .. FOLDER_CONFIG[4].name, save_to_folder4, 4, 5, 1, 1)
     dlg:add_button("📁 " .. FOLDER_CONFIG[5].name, save_to_folder5, 5, 5, 1, 1)
     
-    output_dir_label = dlg:add_label("Last saved to: (none)", 1, 6, 7, 1)
+    output_dir_label = dlg:add_label("Last operation: (none)", 1, 6, 7, 1)
     
-    dlg:add_label("<b>Filename Options:</b>", 1, 7, 7, 1)
-    smart_naming_checkbox = dlg:add_check_box("Smart naming (add time to original timestamp)", true, 1, 8, 5, 1)
+    -- Move buttons (skip first folder since it's "current")
+    dlg:add_label("<b>Move Original & Play Next to:</b>", 1, 7, 7, 1)
+    dlg:add_button("📦→ " .. FOLDER_CONFIG[2].name, move_to_folder2, 1, 8, 1, 1)
+    dlg:add_button("📦→ " .. FOLDER_CONFIG[3].name, move_to_folder3, 2, 8, 1, 1)
+    dlg:add_button("📦→ " .. FOLDER_CONFIG[4].name, move_to_folder4, 3, 8, 1, 1)
+    dlg:add_button("📦→ " .. FOLDER_CONFIG[5].name, move_to_folder5, 4, 8, 1, 1)
     
-    dlg:add_label("Regex Pattern:", 1, 9, 1, 1)
-    regex_pattern_input = dlg:add_text_input(default_regex, 2, 9, 5, 1)
+    dlg:add_label("<b>Filename Options:</b>", 1, 9, 7, 1)
+    smart_naming_checkbox = dlg:add_check_box("Smart naming (add time to original timestamp)", true, 1, 10, 5, 1)
     
-    dlg:add_label("Output Name:", 1, 10, 1, 1)
-    regex_preview_label = dlg:add_label("Preview: (no video loaded)", 2, 10, 5, 1)
+    dlg:add_label("Regex Pattern:", 1, 11, 1, 1)
+    regex_pattern_input = dlg:add_text_input(default_regex, 2, 11, 5, 1)
     
-    dlg:add_label("<b>Trim History:</b>", 1, 11, 7, 1)
-    history_html = dlg:add_html("", 1, 12, 7, 5)
+    dlg:add_label("Output Name:", 1, 12, 1, 1)
+    regex_preview_label = dlg:add_label("Preview: (no video loaded)", 2, 12, 5, 1)
     
-    dlg:add_label("<b>Status:</b>", 1, 17, 1, 1)
-    status_label = dlg:add_label("Ready", 2, 17, 6, 1)
+    dlg:add_label("<b>History:</b>", 1, 13, 7, 1)
+    history_html = dlg:add_html("", 1, 14, 7, 5)
     
-    dlg:add_button("🗑➡ Delete Original & Play Next", delete_and_play_next, 1, 18, 3, 1)
-    dlg:add_button("➡ Keep Original & Play Next", keep_and_play_next, 4, 18, 3, 1)
+    dlg:add_label("<b>Status:</b>", 1, 19, 1, 1)
+    status_label = dlg:add_label("Ready", 2, 19, 6, 1)
+    
+    dlg:add_button("🗑➡ Delete & Next", delete_and_play_next, 1, 20, 2, 1)
+    dlg:add_button("➡ Keep & Next", keep_and_play_next, 3, 20, 2, 1)
     
     update_history_display()
     if current_video_path ~= "" then
-        update_status("Ready. Set times and click a folder button to trim & save.")
+        update_status("Ready. Set times and click a button to trim/move.")
     else
         update_status("Ready. Load a video and set trim points.")
     end
