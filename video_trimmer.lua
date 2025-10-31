@@ -1,45 +1,60 @@
 --[[
  Video Trimmer Extension for VLC
- Version: 2.3
+ Version: 2.5
  
  Features:
  - Set start/end times manually or capture from playback
  - Fine-tune times with increment/decrement buttons
  - Instant trim execution when clicking folder button
- - Smart filename pattern detection with regex (keeps timestamps in filename)
- - Dynamic buttons for subdirectory selection (max 5)
+ - Smart filename pattern detection with regex (YYYYMMDDHHMMSS support)
+ - Adds trim start time to original timestamp in filename
+ - 5 PREDEFINED customizable folder buttons (edit FOLDER_CONFIG below)
  - History display showing all completed trims with full paths
  - Navigate to next video after processing (with option to delete original)
+ 
+ CUSTOMIZE YOUR FOLDERS:
+ Edit the FOLDER_CONFIG table below to set your folder names
 --]]
+
+-- ═══════════════════════════════════════════════════════════════
+-- 📁 CUSTOMIZE YOUR FOLDERS HERE
+-- ═══════════════════════════════════════════════════════════════
+local FOLDER_CONFIG = {
+    {name = "(current)", path = ""},           -- Current folder (don't change this)
+    {name = "clips", path = "clips"},          -- Subfolder 1
+    {name = "trimmed", path = "trimmed"},      -- Subfolder 2
+    {name = "processed", path = "processed"},  -- Subfolder 3
+    {name = "archive", path = "archive"}       -- Subfolder 4
+}
+-- ═══════════════════════════════════════════════════════════════
 
 -- Global variables
 local dlg = nil
-local trim_history = {}  -- Changed from queue to history
+local trim_history = {}
 local current_video_path = ""
 local current_video_dir = ""
-local selected_output_dir = ""  -- Tracks selected output directory
-local ffmpeg_path = "ffmpeg" -- Change this if ffmpeg is not in PATH
+local selected_output_dir = ""
+local ffmpeg_path = "ffmpeg"
 
 -- Text input widgets
 local start_time_input = nil
 local end_time_input = nil
 local current_time_label = nil
 local status_label = nil
-local history_html = nil  -- Changed from trim_list_html
+local history_html = nil
 local smart_naming_checkbox = nil
 local regex_pattern_input = nil
 local regex_preview_label = nil
-local output_dir_label = nil  -- Shows currently selected directory
+local output_dir_label = nil
 
--- Default regex pattern to match timestamp patterns in filename
--- Matches: HHMMSS, HH-MM-SS, HH_MM_SS, YYYYMMDD_HHMMSS, etc.
-local default_regex = "(%d%d%d%d%d%d)(%D?)" -- Matches 6 consecutive digits (HHMMSS)
+-- Improved regex patterns for different timestamp formats
+local default_regex = "(%d%d%d%d%d%d%d%d)_?(%d%d%d%d%d%d)"  -- YYYYMMDD_HHMMSS
 
 -- Extension descriptor
 function descriptor()
     return {
         title = "Video Trimmer",
-        version = "2.3",
+        version = "2.5",
         author = "VLC User",
         capabilities = {"input-listener"}
     }
@@ -47,7 +62,6 @@ end
 
 -- Helper function: Check if path is Windows-style
 function is_windows_path(path)
-    -- Check for drive letter (C:, D:, etc.) or backslashes
     return path:match("^%a:") ~= nil or path:match("\\") ~= nil
 end
 
@@ -72,60 +86,8 @@ end
 -- Helper function: Join path components
 function join_path(dir, filename)
     local sep = get_path_separator(dir)
-    -- Remove trailing separator from dir if present
     dir = dir:gsub("[/\\]+$", "")
     return dir .. sep .. filename
-end
-
--- Helper function: Get subdirectories of a directory (max 5)
-function get_subdirectories(dir)
-    local subdirs = {}
-    
-    if not dir or dir == "" then
-        return subdirs
-    end
-    
-    -- Normalize the path
-    dir = normalize_path(dir)
-    local sep = get_path_separator(dir)
-    
-    -- Build command based on OS
-    local cmd
-    if is_windows_path(dir) then
-        -- Windows: use dir command
-        cmd = 'dir "' .. dir .. '" /b /ad 2>nul'
-    else
-        -- Linux/Mac: use find command
-        cmd = 'find "' .. dir .. '" -mindepth 1 -maxdepth 1 -type d 2>/dev/null'
-    end
-    
-    -- Execute command and parse results
-    local handle = io.popen(cmd)
-    if handle then
-        local count = 0
-        for line in handle:lines() do
-            if count >= 5 then break end  -- Limit to 5 subdirectories
-            
-            line = line:gsub("^%s+", ""):gsub("%s+$", "")  -- Trim whitespace
-            if line ~= "" then
-                if is_windows_path(dir) then
-                    -- Windows returns just the directory name
-                    table.insert(subdirs, line)
-                    count = count + 1
-                else
-                    -- Linux returns full path, extract just the directory name
-                    local dirname = line:match("([^/]+)$")
-                    if dirname then
-                        table.insert(subdirs, dirname)
-                        count = count + 1
-                    end
-                end
-            end
-        end
-        handle:close()
-    end
-    
-    return subdirs
 end
 
 -- Helper function: Convert microseconds to HH:MM:SS format
@@ -144,12 +106,82 @@ function time_to_seconds(time_str)
     return tonumber(hours) * 3600 + tonumber(minutes) * 60 + tonumber(seconds)
 end
 
--- Helper function: Convert seconds to HHMMSS format (for filename)
-function seconds_to_hhmmss(seconds)
-    local hours = math.floor(seconds / 3600)
-    local minutes = math.floor((seconds % 3600) / 60)
-    local secs = math.floor(seconds % 60)
-    return string.format("%02d%02d%02d", hours, minutes, secs)
+-- Helper function: Parse timestamp from filename
+function parse_timestamp_from_filename(filename, regex)
+    local date_part, time_part = filename:match(regex)
+    
+    if date_part and time_part then
+        return date_part, time_part
+    end
+    
+    local just_time = filename:match("(%d%d%d%d%d%d)")
+    if just_time then
+        return nil, just_time
+    end
+    
+    return nil, nil
+end
+
+-- Helper function: Add seconds to timestamp
+function add_seconds_to_timestamp(date_part, time_part, seconds_to_add)
+    local hours = tonumber(time_part:sub(1, 2))
+    local minutes = tonumber(time_part:sub(3, 4))
+    local seconds = tonumber(time_part:sub(5, 6))
+    
+    local total_seconds = hours * 3600 + minutes * 60 + seconds
+    total_seconds = total_seconds + seconds_to_add
+    
+    local days_to_add = 0
+    if total_seconds >= 86400 then
+        days_to_add = math.floor(total_seconds / 86400)
+        total_seconds = total_seconds % 86400
+    elseif total_seconds < 0 then
+        days_to_add = -1
+        total_seconds = total_seconds + 86400
+    end
+    
+    local new_hours = math.floor(total_seconds / 3600)
+    local new_minutes = math.floor((total_seconds % 3600) / 60)
+    local new_seconds = math.floor(total_seconds % 60)
+    
+    local new_time_part = string.format("%02d%02d%02d", new_hours, new_minutes, new_seconds)
+    
+    local new_date_part = date_part
+    if date_part and days_to_add ~= 0 then
+        local year = tonumber(date_part:sub(1, 4))
+        local month = tonumber(date_part:sub(5, 6))
+        local day = tonumber(date_part:sub(7, 8))
+        
+        day = day + days_to_add
+        
+        local days_in_month = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
+        
+        if (year % 4 == 0 and year % 100 ~= 0) or (year % 400 == 0) then
+            days_in_month[2] = 29
+        end
+        
+        while day > days_in_month[month] do
+            day = day - days_in_month[month]
+            month = month + 1
+            if month > 12 then
+                month = 1
+                year = year + 1
+            end
+        end
+        
+        while day < 1 do
+            month = month - 1
+            if month < 1 then
+                month = 12
+                year = year - 1
+            end
+            day = day + days_in_month[month]
+        end
+        
+        new_date_part = string.format("%04d%02d%02d", year, month, day)
+    end
+    
+    return new_date_part, new_time_part
 end
 
 -- Helper function: Validate time format
@@ -172,10 +204,8 @@ function get_video_path()
     local item = vlc.input.item()
     if item then
         local uri = item:uri()
-        -- Convert file:/// URI to regular path
         if uri then
-            -- Remove file:/// prefix and decode URL encoding
-            local path = uri:gsub("^file:///", "")
+            local path = uri:gsub("^file:///", "/")
             path = path:gsub("^file://", "")
             path = path:gsub("%%(%x%x)", function(hex)
                 return string.char(tonumber(hex, 16))
@@ -188,10 +218,9 @@ end
 
 -- Helper function: Extract directory from full path
 function get_directory_from_path(filepath)
-    local sep = get_path_separator(filepath)
     local dir = filepath:match("^(.-)[^\\/]+$")
     if dir and dir ~= "" then
-        return dir:gsub("[/\\]+$", "")  -- Remove trailing separator
+        return dir:gsub("[/\\]+$", "")
     end
     return ""
 end
@@ -201,46 +230,52 @@ function get_filename_from_path(filepath)
     return filepath:match("([^\\/]+)$") or filepath
 end
 
--- Helper function: Extract filename components with pattern matching
+-- Helper function: Parse filename components with pattern matching
 function parse_filename(filepath, regex)
     local filename = get_filename_from_path(filepath)
     local base_name, ext = filename:match("^(.-)%.([^%.]+)$")
     
     if not base_name then
-        return nil, nil, nil, nil, nil
+        return nil, nil, nil, nil, nil, nil
     end
     
-    -- Try to match the pattern in filename
-    local matched_time, separator = base_name:match(regex)
-    local name_without_time = base_name
+    local date_part, time_part = parse_timestamp_from_filename(base_name, regex)
+    local name_without_timestamp = base_name
     
-    if matched_time then
-        -- Found a time pattern - extract the base name without the time
-        name_without_time = base_name:gsub(regex, "")
-        -- Remove trailing separators/underscores
-        name_without_time = name_without_time:gsub("[_%-]$", "")
+    if time_part then
+        if date_part then
+            name_without_timestamp = base_name:gsub(date_part .. "_?" .. time_part, "")
+        else
+            name_without_timestamp = base_name:gsub(time_part, "")
+        end
+        name_without_timestamp = name_without_timestamp:gsub("[_%-]+$", "")
     end
     
-    return filename, base_name, name_without_time, matched_time, ext
+    return filename, base_name, name_without_timestamp, date_part, time_part, ext
 end
 
 -- Helper function: Generate smart filename
 function generate_smart_filename(filepath, start_seconds, use_smart_naming, regex, output_dir)
-    local filename, base_name, name_without_time, matched_time, ext = parse_filename(filepath, regex)
+    local filename, base_name, name_without_timestamp, date_part, time_part, ext = parse_filename(filepath, regex)
     
     if not filename then
-        -- Fallback if parsing fails
         return join_path(output_dir, get_filename_from_path(filepath):gsub("%.([^%.]+)$", "_trim.%1"))
     end
     
     local new_filename
     
-    if use_smart_naming and matched_time then
-        -- Smart naming: replace original time with new time based on trim start
-        local new_time = seconds_to_hhmmss(start_seconds)
-        new_filename = name_without_time .. new_time .. "." .. ext
+    if use_smart_naming and time_part then
+        local new_date_part, new_time_part = add_seconds_to_timestamp(date_part, time_part, start_seconds)
+        
+        if new_date_part then
+            new_filename = name_without_timestamp .. new_date_part .. "_" .. new_time_part .. "." .. ext
+        else
+            new_filename = name_without_timestamp .. new_time_part .. "." .. ext
+        end
+        
+        new_filename = new_filename:gsub("__+", "_")
+        new_filename = new_filename:gsub("^_", "")
     else
-        -- Default naming: append _trim suffix
         new_filename = base_name .. "_trim." .. ext
     end
     
@@ -270,7 +305,6 @@ function generate_filename_preview()
     local output_file = generate_smart_filename(current_video_path, start_sec, use_smart, regex, output_dir)
     local filename = get_filename_from_path(output_file)
     
-    -- Show the subdirectory if not current
     if output_dir ~= current_video_dir then
         local relative = output_dir:match("([^\\/]+)$")
         regex_preview_label:set_text("Preview: " .. relative .. get_path_separator(output_dir) .. filename)
@@ -289,7 +323,6 @@ function update_history_display()
     if #trim_history == 0 then
         html = html .. "<i>No trims completed yet</i><br>"
     else
-        -- Show most recent first (reverse order)
         for i = #trim_history, 1, -1 do
             local trim = trim_history[i]
             html = html .. string.format("%d. %s → %s<br>", 
@@ -307,12 +340,10 @@ function update_history_display()
     history_html:set_text(html)
 end
 
--- Callback: Execute trim and save to directory (INSTANT EXECUTION)
+-- Callback: Execute trim and save to directory
 function execute_trim_to_directory(dir_path)
-    -- First, set the selected directory
     selected_output_dir = dir_path
     
-    -- Update the label to show selected directory
     if output_dir_label then
         if dir_path == current_video_dir then
             output_dir_label:set_text("Last saved to: (current folder)")
@@ -322,10 +353,8 @@ function execute_trim_to_directory(dir_path)
         end
     end
     
-    -- Update preview
     generate_filename_preview()
     
-    -- Validate times
     local start_time = start_time_input:get_text()
     local end_time = end_time_input:get_text()
     
@@ -342,14 +371,12 @@ function execute_trim_to_directory(dir_path)
         return
     end
     
-    -- Get current video path
     current_video_path = get_video_path()
     if current_video_path == "" then
         update_status("ERROR: No video loaded")
         return
     end
     
-    -- Execute trim immediately
     update_status("Processing trim...")
     
     local use_smart_naming = smart_naming_checkbox:get_checked()
@@ -357,7 +384,6 @@ function execute_trim_to_directory(dir_path)
     
     local output_file = generate_smart_filename(current_video_path, start_sec, use_smart_naming, regex, dir_path)
     
-    -- Build FFmpeg command
     local duration = end_sec - start_sec
     local cmd = string.format('%s -i "%s" -ss %.3f -t %.3f -c copy "%s"',
         ffmpeg_path,
@@ -366,10 +392,8 @@ function execute_trim_to_directory(dir_path)
         duration,
         output_file)
     
-    -- Execute command
     local result = os.execute(cmd)
     
-    -- Create history entry
     local history_entry = {
         start_time = start_time,
         end_time = end_time,
@@ -387,16 +411,14 @@ function execute_trim_to_directory(dir_path)
         update_status("✗ Trim failed - check FFmpeg installation")
     end
     
-    -- Update history display
     update_history_display()
     
-    -- Clear inputs for next trim
     start_time_input:set_text("00:00:00.000")
     end_time_input:set_text("00:00:00.000")
     generate_filename_preview()
 end
 
--- Callback: Adjust time by increment (in seconds)
+-- Callback: Adjust time by increment
 function adjust_time(input_widget, increment_seconds)
     local time_str = input_widget:get_text()
     if not validate_time(time_str) then
@@ -405,7 +427,7 @@ function adjust_time(input_widget, increment_seconds)
     end
     
     local seconds = time_to_seconds(time_str)
-    seconds = math.max(0, seconds + increment_seconds) -- Don't go below 0
+    seconds = math.max(0, seconds + increment_seconds)
     
     local hours = math.floor(seconds / 3600)
     local minutes = math.floor((seconds % 3600) / 60)
@@ -413,46 +435,18 @@ function adjust_time(input_widget, increment_seconds)
     
     local new_time = string.format("%02d:%02d:%06.3f", hours, minutes, secs)
     input_widget:set_text(new_time)
-    
-    -- Update preview if smart naming is enabled
     generate_filename_preview()
 end
 
--- Callback: Increment/decrement start time
-function start_time_up()
-    adjust_time(start_time_input, 1)
-end
+function start_time_up() adjust_time(start_time_input, 1) end
+function start_time_down() adjust_time(start_time_input, -1) end
+function start_time_up_fast() adjust_time(start_time_input, 10) end
+function start_time_down_fast() adjust_time(start_time_input, -10) end
+function end_time_up() adjust_time(end_time_input, 1) end
+function end_time_down() adjust_time(end_time_input, -1) end
+function end_time_up_fast() adjust_time(end_time_input, 10) end
+function end_time_down_fast() adjust_time(end_time_input, -10) end
 
-function start_time_down()
-    adjust_time(start_time_input, -1)
-end
-
-function start_time_up_fast()
-    adjust_time(start_time_input, 10)
-end
-
-function start_time_down_fast()
-    adjust_time(start_time_input, -10)
-end
-
--- Callback: Increment/decrement end time
-function end_time_up()
-    adjust_time(end_time_input, 1)
-end
-
-function end_time_down()
-    adjust_time(end_time_input, -1)
-end
-
-function end_time_up_fast()
-    adjust_time(end_time_input, 10)
-end
-
-function end_time_down_fast()
-    adjust_time(end_time_input, -10)
-end
-
--- Callback: Capture start time
 function capture_start_time()
     local time = get_current_time()
     local time_str = microseconds_to_time(time)
@@ -461,7 +455,6 @@ function capture_start_time()
     generate_filename_preview()
 end
 
--- Callback: Capture end time
 function capture_end_time()
     local time = get_current_time()
     local time_str = microseconds_to_time(time)
@@ -469,41 +462,31 @@ function capture_end_time()
     update_status("End time set to: " .. time_str)
 end
 
--- Helper function: Play next video in playlist
 function play_next_video()
-    -- Check if there are more items in playlist
     local playlist = vlc.playlist.get("playlist")
     if playlist and playlist.children then
-        -- Try to play next
         vlc.playlist.next()
         update_status("Playing next video...")
         
-        -- Small delay to let VLC switch videos
         local start_time = os.clock()
-        while os.clock() - start_time < 0.5 do
-            -- Brief pause
-        end
+        while os.clock() - start_time < 0.5 do end
         
-        -- Update current video path and directory
         current_video_path = get_video_path()
         current_video_dir = get_directory_from_path(current_video_path)
-        selected_output_dir = current_video_dir  -- Reset to current directory
+        selected_output_dir = current_video_dir
         
-        -- Clear history for new video
         trim_history = {}
         update_history_display()
         generate_filename_preview()
         
-        update_status("New video loaded. Please reopen extension to refresh directory buttons.")
+        update_status("New video loaded. Please reopen extension to refresh.")
     else
         update_status("No more videos in playlist")
     end
 end
 
--- Callback: Delete original and play next
 function delete_and_play_next()
     if current_video_path ~= "" and #trim_history > 0 then
-        -- Delete the original file
         local success, err = os.remove(current_video_path)
         if success then
             update_status("Original video deleted. Loading next...")
@@ -513,25 +496,20 @@ function delete_and_play_next()
     else
         update_status("Nothing to delete (no trims completed)")
     end
-    
-    -- Play next video
     play_next_video()
 end
 
--- Callback: Keep original and play next
 function keep_and_play_next()
     update_status("Original video kept. Loading next...")
     play_next_video()
 end
 
--- Update status message
 function update_status(message)
     if status_label then
         status_label:set_text(message)
     end
 end
 
--- Update current time display (called periodically)
 function update_current_time_display()
     if current_time_label and vlc.input.is_playing() then
         local time = get_current_time()
@@ -540,34 +518,70 @@ function update_current_time_display()
     end
 end
 
--- Callback: Smart naming checkbox changed
 function smart_naming_changed()
     generate_filename_preview()
 end
 
--- Callback: Regex pattern changed
 function regex_pattern_changed()
     generate_filename_preview()
 end
 
--- Called when extension is activated
+-- Predefined callback functions for each folder button
+function save_to_folder1()
+    local folder_path = FOLDER_CONFIG[1].path
+    if folder_path == "" then
+        execute_trim_to_directory(current_video_dir)
+    else
+        execute_trim_to_directory(join_path(current_video_dir, folder_path))
+    end
+end
+
+function save_to_folder2()
+    local folder_path = FOLDER_CONFIG[2].path
+    if folder_path == "" then
+        execute_trim_to_directory(current_video_dir)
+    else
+        execute_trim_to_directory(join_path(current_video_dir, folder_path))
+    end
+end
+
+function save_to_folder3()
+    local folder_path = FOLDER_CONFIG[3].path
+    if folder_path == "" then
+        execute_trim_to_directory(current_video_dir)
+    else
+        execute_trim_to_directory(join_path(current_video_dir, folder_path))
+    end
+end
+
+function save_to_folder4()
+    local folder_path = FOLDER_CONFIG[4].path
+    if folder_path == "" then
+        execute_trim_to_directory(current_video_dir)
+    else
+        execute_trim_to_directory(join_path(current_video_dir, folder_path))
+    end
+end
+
+function save_to_folder5()
+    local folder_path = FOLDER_CONFIG[5].path
+    if folder_path == "" then
+        execute_trim_to_directory(current_video_dir)
+    else
+        execute_trim_to_directory(join_path(current_video_dir, folder_path))
+    end
+end
+
 function activate()
-    -- Get initial video info
     current_video_path = get_video_path()
     current_video_dir = get_directory_from_path(current_video_path)
-    selected_output_dir = current_video_dir  -- Default to current directory
+    selected_output_dir = current_video_dir
     
-    -- Get subdirectories
-    local subdirs = get_subdirectories(current_video_dir)
+    dlg = vlc.dialog("Video Trimmer v2.5")
     
-    -- Create dialog
-    dlg = vlc.dialog("Video Trimmer v2.3")
-    
-    -- Row 1: Current time display
     dlg:add_label("<b>Current Playback Time:</b>", 1, 1, 2, 1)
     current_time_label = dlg:add_label("Current: 00:00:00.000", 3, 1, 2, 1)
     
-    -- Row 2: Start time with adjustment buttons
     dlg:add_label("Start Time:", 1, 2, 1, 1)
     start_time_input = dlg:add_text_input("00:00:00.000", 2, 2, 1, 1)
     dlg:add_button("−10s", start_time_down_fast, 3, 2, 1, 1)
@@ -576,7 +590,6 @@ function activate()
     dlg:add_button("+10s", start_time_up_fast, 6, 2, 1, 1)
     dlg:add_button("⏺ Capture", capture_start_time, 7, 2, 1, 1)
     
-    -- Row 3: End time with adjustment buttons
     dlg:add_label("End Time:", 1, 3, 1, 1)
     end_time_input = dlg:add_text_input("00:00:00.000", 2, 3, 1, 1)
     dlg:add_button("−10s", end_time_down_fast, 3, 3, 1, 1)
@@ -585,55 +598,35 @@ function activate()
     dlg:add_button("+10s", end_time_up_fast, 6, 3, 1, 1)
     dlg:add_button("⏺ Capture", capture_end_time, 7, 3, 1, 1)
     
-    -- Row 4: Output directory buttons header
     dlg:add_label("<b>Trim & Save to Directory (click button to execute):</b>", 1, 4, 7, 1)
     
-    -- Row 5: Directory selection buttons (dynamically created, max 5 subdirs)
-    -- KEEPING DYNAMIC BUTTON DISPLAY EXACTLY AS BEFORE - DO NOT TOUCH!
-    -- First button: current folder
-    local col = 1
-    dlg:add_button("📁 (current)", function() execute_trim_to_directory(current_video_dir) end, col, 5, 1, 1)
-    col = col + 1
+    -- PREDEFINED BUTTONS - No loops, no closures, just explicit buttons
+    dlg:add_button("📁 " .. FOLDER_CONFIG[1].name, save_to_folder1, 1, 5, 1, 1)
+    dlg:add_button("📁 " .. FOLDER_CONFIG[2].name, save_to_folder2, 2, 5, 1, 1)
+    dlg:add_button("📁 " .. FOLDER_CONFIG[3].name, save_to_folder3, 3, 5, 1, 1)
+    dlg:add_button("📁 " .. FOLDER_CONFIG[4].name, save_to_folder4, 4, 5, 1, 1)
+    dlg:add_button("📁 " .. FOLDER_CONFIG[5].name, save_to_folder5, 5, 5, 1, 1)
     
-    -- Additional buttons for subdirectories (max 5)
-    for i, subdir in ipairs(subdirs) do
-        if i <= 4 then  -- Max 4 subdirs + 1 current = 5 total buttons
-            local subdir_path = join_path(current_video_dir, subdir)
-            dlg:add_button("📁 " .. subdir, function() execute_trim_to_directory(subdir_path) end, col, 5, 1, 1)
-            col = col + 1
-        end
-    end
-    
-    -- Row 6: Selected directory indicator
     output_dir_label = dlg:add_label("Last saved to: (none)", 1, 6, 7, 1)
     
-    -- Row 7: Filename options header
     dlg:add_label("<b>Filename Options:</b>", 1, 7, 7, 1)
+    smart_naming_checkbox = dlg:add_check_box("Smart naming (add time to original timestamp)", true, 1, 8, 5, 1)
     
-    -- Row 8: Smart naming checkbox
-    smart_naming_checkbox = dlg:add_check_box("Smart naming (keep time pattern)", true, 1, 8, 3, 1)
-    
-    -- Row 9: Regex pattern
     dlg:add_label("Regex Pattern:", 1, 9, 1, 1)
     regex_pattern_input = dlg:add_text_input(default_regex, 2, 9, 5, 1)
     
-    -- Row 10: Preview
     dlg:add_label("Output Name:", 1, 10, 1, 1)
     regex_preview_label = dlg:add_label("Preview: (no video loaded)", 2, 10, 5, 1)
     
-    -- Row 11-15: History display
     dlg:add_label("<b>Trim History:</b>", 1, 11, 7, 1)
     history_html = dlg:add_html("", 1, 12, 7, 5)
     
-    -- Row 17: Status
     dlg:add_label("<b>Status:</b>", 1, 17, 1, 1)
     status_label = dlg:add_label("Ready", 2, 17, 6, 1)
     
-    -- Row 18: Navigation buttons
     dlg:add_button("🗑➡ Delete Original & Play Next", delete_and_play_next, 1, 18, 3, 1)
     dlg:add_button("➡ Keep Original & Play Next", keep_and_play_next, 4, 18, 3, 1)
     
-    -- Initialize displays
     update_history_display()
     if current_video_path ~= "" then
         update_status("Ready. Set times and click a folder button to trim & save.")
@@ -643,7 +636,6 @@ function activate()
     generate_filename_preview()
 end
 
--- Called when extension is deactivated
 function deactivate()
     if dlg then
         dlg:delete()
@@ -651,25 +643,20 @@ function deactivate()
     end
 end
 
--- Called when dialog is closed
 function close()
     vlc.deactivate()
 end
 
--- Called when input changes (new video loaded)
 function input_changed()
     current_video_path = get_video_path()
     current_video_dir = get_directory_from_path(current_video_path)
     
     if current_video_path ~= "" then
         update_status("Video loaded: " .. get_filename_from_path(current_video_path))
-        -- Note: Directory buttons don't update dynamically
-        -- User should reopen extension for new video
     end
     update_current_time_display()
 end
 
--- Called during playback (to update current time)
 function meta_changed()
     update_current_time_display()
 end
