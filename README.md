@@ -1,4 +1,4 @@
-# Beaver Trimmer 🦫
+# VLC Trimmer
 
 A powerful VLC extension for trimming videos on the fly with smart filename handling and batch processing capabilities.
 
