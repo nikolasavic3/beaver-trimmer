@@ -101,7 +101,7 @@ function microseconds_to_time(microseconds)
     local hours = math.floor(total_seconds / 3600)
     local minutes = math.floor((total_seconds % 3600) / 60)
     local seconds = total_seconds % 60
-    return string.format("%02d:%02d:%06.3f", hours, minutes, seconds)
+    return string.format("%02d:%02d:%06.3f", hours, minutes, seconds):gsub(",", ".")
 end
 
 -- Helper function: Convert HH:MM:SS to seconds (for FFmpeg)
@@ -149,7 +149,7 @@ function add_seconds_to_timestamp(date_part, time_part, seconds_to_add)
     local new_minutes = math.floor((total_seconds % 3600) / 60)
     local new_seconds = math.floor(total_seconds % 60)
     
-    local new_time_part = string.format("%02d%02d%02d", new_hours, new_minutes, new_seconds)
+    local new_time_part = string.format("%02d%02d%02d", new_hours, new_minutes, new_seconds):gsub(",", ".")
     
     local new_date_part = date_part
     if date_part and days_to_add ~= 0 then
@@ -191,7 +191,7 @@ end
 
 -- Helper function: Validate time format
 function validate_time(time_str)
-    return time_str:match("^%d+:%d+:[%d.]+$") ~= nil
+    return time_str:match("^%d%d:%d%d:%d%d%.%d%d%d$") ~= nil
 end
 
 -- Helper function: Get current playback time
@@ -211,7 +211,7 @@ function get_video_path()
         local uri = item:uri()
         if uri then
             -- Decode the URI
-            local path = uri:gsub("^file:///", "")
+            local path = uri:gsub("^file:///", "/")
             path = path:gsub("^file://", "")
             
             -- URL decode
@@ -298,7 +298,7 @@ function parse_filename(filepath, regex)
                 separator = ""
             end
         else
-            -- No timestamp found; prefix is whole name
+        -- No timestamp found; prefix is whole name
             prefix = base_name
             timestamp_str = ""
             suffix = ""
@@ -515,17 +515,21 @@ function execute_trim_to_directory(dir_path)
     
     local use_smart_naming = smart_naming_checkbox:get_checked()
     local regex = regex_pattern_input:get_text()
-    
+   
     local output_file = generate_smart_filename(current_video_path, start_sec, use_smart_naming, regex, dir_path)
     
     local duration = end_sec - start_sec
     
     -- Universal solution: Copy video, re-encode audio to AAC for maximum compatibility
-    local cmd = string.format('%s -y -i "%s" -ss %.3f -t %.3f -c:v copy -c:a aac -b:a 128k "%s" 2>&1',
+
+    local start_sec_str = string.format("%.3f", start_sec):gsub(",", ".")
+    local duration_str  = string.format("%.3f", duration):gsub(",", ".")
+
+    local cmd = string.format('%s -y -i "%s" -ss %s -t %s -c:v copy -c:a aac -b:a 128k "%s" 2>&1',
         ffmpeg_path,
         current_video_path,
-        start_sec,
-        duration,
+        start_sec_str,
+        duration_str,
         output_file)
     
     -- Try to capture error output
@@ -627,6 +631,7 @@ function adjust_time(input_widget, increment_seconds)
     local secs = seconds % 60
     
     local new_time = string.format("%02d:%02d:%06.3f", hours, minutes, secs)
+    new_time = new_time:gsub(",", ".")
     input_widget:set_text(new_time)
     generate_filename_preview()
 end
