@@ -191,7 +191,7 @@ end
 
 -- Helper function: Validate time format
 function validate_time(time_str)
-    return time_str:match("^%d+:%d+:[%d.]+$") ~= nil
+    return time_str:match("^%d%d:%d%d:%d%d%.%d%d%d$") ~= nil
 end
 
 -- Helper function: Get current playback time
@@ -627,6 +627,7 @@ function adjust_time(input_widget, increment_seconds)
     local secs = seconds % 60
     
     local new_time = string.format("%02d:%02d:%06.3f", hours, minutes, secs)
+    new_time = new_time:gsub(",", ".")
     input_widget:set_text(new_time)
     generate_filename_preview()
 end
